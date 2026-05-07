@@ -1,5 +1,6 @@
-import { createFileRoute } from "@tanstack/react-router";
+﻿import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -13,19 +14,19 @@ import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/_app/chat")({
   component: ChatPage,
-  head: () => ({ meta: [{ title: "Chat — Atlas" }] }),
+  head: () => ({ meta: [{ title: "Chat â€” EagleVision" }] }),
 });
 
 type Msg = { id?: string; role: "user" | "assistant"; content: string };
 type Conv = { id: string; title: string; model: string };
 
 const MODELS = [
-  { value: "google/gemini-3-flash-preview", label: "Gemini 3 Flash" },
-  { value: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
-  { value: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
-  { value: "openai/gpt-5", label: "GPT-5" },
   { value: "openai/gpt-5-mini", label: "GPT-5 Mini" },
+  { value: "openai/gpt-5", label: "GPT-5" },
+  { value: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   { value: "openai/gpt-5.2", label: "GPT-5.2" },
+  { value: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+  { value: "google/gemini-3-flash-preview", label: "Gemini 3 Flash (no tools)" },
 ];
 
 function ChatPage() {
@@ -36,6 +37,7 @@ function ChatPage() {
   const [model, setModel] = useState(MODELS[0].value);
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     loadConvs();
@@ -93,6 +95,13 @@ function ChatPage() {
     const { data: u } = await supabase.auth.getUser();
     if (!u.user) return;
 
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
+    if (!accessToken) {
+      toast.error("Not signed in");
+      return;
+    }
+
     let convId = activeId;
     if (!convId) {
       const { data, error } = await supabase
@@ -116,18 +125,7 @@ function ChatPage() {
     });
 
     setLoading(true);
-    let assistantSoFar = "";
-    const upsert = (chunk: string) => {
-      assistantSoFar += chunk;
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.role === "assistant")
-          return prev.map((m, i) =>
-            i === prev.length - 1 ? { ...m, content: assistantSoFar } : m,
-          );
-        return [...prev, { role: "assistant", content: assistantSoFar }];
-      });
-    };
+    setMessages((m) => [...m, { role: "assistant", content: "â€¦" }]);
 
     try {
       const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
@@ -135,7 +133,7 @@ function ChatPage() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          Authorization: `Bearer ${accessToken}`,
         },
         body: JSON.stringify({
           model,
@@ -145,63 +143,54 @@ function ChatPage() {
           })),
         }),
       });
-      if (!resp.ok || !resp.body) {
+
+      if (!resp.ok) {
         if (resp.status === 429) toast.error("Rate limited, slow down.");
         else if (resp.status === 402) toast.error("AI credits exhausted.");
+        else if (resp.status === 401) toast.error("Session expired â€” sign in again.");
         else toast.error("AI error");
+        setMessages((m) => m.slice(0, -1));
         setLoading(false);
         return;
       }
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      let done = false;
-      while (!done) {
-        const r = await reader.read();
-        if (r.done) break;
-        buf += decoder.decode(r.value, { stream: true });
-        let idx: number;
-        while ((idx = buf.indexOf("\n")) !== -1) {
-          let line = buf.slice(0, idx);
-          buf = buf.slice(idx + 1);
-          if (line.endsWith("\r")) line = line.slice(0, -1);
-          if (!line.startsWith("data: ")) continue;
-          const j = line.slice(6).trim();
-          if (j === "[DONE]") {
-            done = true;
-            break;
-          }
-          try {
-            const parsed = JSON.parse(j);
-            const c = parsed.choices?.[0]?.delta?.content;
-            if (c) upsert(c);
-          } catch {
-            buf = line + "\n" + buf;
-            break;
-          }
-        }
-      }
+
+      const data = await resp.json();
+      const replyText: string = data.reply ?? "";
+      const touched: string[] = data.touched ?? [];
+
+      setMessages((m) =>
+        m.map((msg, i) =>
+          i === m.length - 1 && msg.role === "assistant"
+            ? { ...msg, content: replyText }
+            : msg,
+        ),
+      );
+
       await supabase.from("messages").insert({
         conversation_id: convId,
         user_id: u.user.id,
         role: "assistant",
-        content: assistantSoFar,
+        content: replyText,
       });
-      const provider = model.split("/")[0];
-      const promptTokens = Math.ceil(
-        [...messages, userMsg].reduce((a, m) => a + m.content.length, 0) / 4,
-      );
-      const completionTokens = Math.ceil(assistantSoFar.length / 4);
-      await supabase.from("usage_log").insert({
-        user_id: u.user.id,
-        provider,
-        model,
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokens,
-        cost_usd: 0,
-      });
+
+      for (const table of touched) {
+        queryClient.invalidateQueries({ queryKey: [table] });
+      }
+
+      if (data.usage) {
+        const provider = model.split("/")[0];
+        await supabase.from("usage_log").insert({
+          user_id: u.user.id,
+          provider,
+          model,
+          prompt_tokens: data.usage.prompt_tokens ?? 0,
+          completion_tokens: data.usage.completion_tokens ?? 0,
+          cost_usd: 0,
+        });
+      }
     } catch (e) {
       toast.error("Network error");
+      setMessages((m) => m.slice(0, -1));
     } finally {
       setLoading(false);
     }
@@ -294,7 +283,7 @@ function ChatPage() {
                         remarkPlugins={[remarkGfm]}
                         rehypePlugins={[rehypeHighlight]}
                       >
-                        {m.content || "…"}
+                        {m.content || "â€¦"}
                       </ReactMarkdown>
                     </div>
                   ) : (
@@ -317,7 +306,7 @@ function ChatPage() {
                   send();
                 }
               }}
-              placeholder="Message Atlas…"
+              placeholder="Message EagleVisionâ€¦"
               className="min-h-[52px] resize-none"
               rows={1}
             />
